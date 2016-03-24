@@ -1,4 +1,6 @@
 <?php
+	$COUNT_DEBUG = 80;
+
 	function get_method_paramsName($objectName, $methodName) {
 		$f = new ReflectionMethod($objectName, $methodName);
 		$result = array();
@@ -11,7 +13,7 @@
 	    return (is_string($f) && function_exists($f)) || (is_object($f) && ($f instanceof Closure));
 	}
 
-	abstract class LittlePAPI implements JsonSerializable {
+	abstract class LittlePAPI implements JsonSerializable{
 		protected	$id;
 		private		$isLoaded = false;
 		private		$cache;
@@ -24,11 +26,15 @@
 		protected static $keys = array();
 		protected static $tableName;
 		protected static $relationsDescription;
+
+		protected static $forceLoadFull = false;
+		protected $pleaseFullLoad = false;
 		
 
 
 		/* ############# Constructor/destructor ############# */ 
-		function __construct($id){
+		function __construct($id, $pleaseFullLoad = false){
+			$this->pleaseFullLoad = static::$forceLoadFull || $pleaseFullLoad;
 			$this->cache = array();
 			$this->data = array();
 			$this->loadRoutine;
@@ -52,7 +58,7 @@
 
 
 		/* ############# Create a new entry in db ############# */ 
-		public static function create($data){
+		public static function create($data = []){
 			$argsTab =[];
 			$argsTabRef =[];
 			$argsKeys = [];
@@ -93,8 +99,9 @@
 						throw new Exception("Error Processing Request", 1);
 				}
 
-			$request = static::$db->prepare('INSERT INTO Projets ('.implode(',', $argsKeys).') VALUES ('.$fields.')');
-			call_user_func_array([$request, 'bind_param'], array_merge(array($type), $argsTabRef));
+			$request = static::$db->prepare('INSERT INTO '.($cclass::$tableName).' ('.implode(',', $argsKeys).') VALUES ('.$fields.')');
+			if(count($argsTabRef)!=0)
+				call_user_func_array([$request, 'bind_param'], array_merge(array($type), $argsTabRef));
 			$request->execute();
 
 			if(!static::$db)
@@ -106,49 +113,58 @@
 			return new Projet(static::$db->insert_id);
 		}
 
-
-
+		private static function _constructSQLRequestDependencies(){
+			return ','.implode(',', array_map(function($r){
+					return '(SELECT GROUP_CONCAT(`'.$r['externId'].'`) FROM `'.$r['tableName'].'` WHERE `'.$r['internId'].'`=t.id) as `_'.$r['name'].'`';
+				}, static::$relationsDescription));
+		}
+		private static function _constructSQLRequest(){
+			return 'SELECT *'.static::_constructSQLRequestDependencies().' FROM `'.
+							static::$tableName.'` as t';
+		}
 
 		/* ############# Cache related functions ############# */ 
 		public function load($force = false){
 			if($this->isLoaded && !$force)
 				throw new Exception("Already loaded");
-			$res = static::$db->query('SELECT * FROM '.static::$tableName.' WHERE id='.intval($this->id)) or die(mysqli_error(static::$db));
+			
+			$res = static::$db->query(static::_constructSQLRequest().' WHERE id='.intval($this->id)) or die(mysqli_error(static::$db));
+
 			if(!$res) throw new Exception("Error Processing Request");
 			$res = $res->fetch_assoc();
 			if(!$res) throw new Exception("Error Processing Request");
 
+			$this->buildFromData($res);
+		}
+		public function buildFromData($data){
+			if($this->isLoaded)
+				throw new Exception("Loaded already");
+
 			if(is_function(@$this->loadRoutine['@remplace']))
 				$this->loadRoutine['@remplace']($res->fetch_assoc());
 			else{
-				foreach ($res as $key => $value)
+				foreach ($data as $key => $value)
 					if(@$this->loadRoutine[$key])
-						$this->data[$key] = $this->loadRoutine[$key];
+						$this->data[$key] = $this->loadRoutine[$key]($value);
 					elseif(in_array($key, static::$keys))
 						$this->data[$key] = $value;
-					elseif($key!='id')
+					elseif($this->doesRelationExists(substr($key, 1))){
+						$ids = array_filter(explode(',', $value), function($o){return $o!=='';});
+						$this->_storeRelationInCache($this->getRelationDescriptor(substr($key, 1)), $ids);
+					}elseif($key!='id')
 						throw new Exception("Err key".$key);
 			}
 			if(is_function(@$this->loadRoutine['@after']))
 				$this->loadRoutine['@after']();
 
 			$this->forceLoadRelationsData();
-
-			$this->isLoaded = true;
-		}
-		public function buildFromData($data){
-			if($this->isLoaded)
-				throw new Exception("Loaded already");
-			foreach (static::$keys as $k)
-				$this->data[$k] = @$data[$k];
-			$this->forceLoadRelationsData();
 			$this->isLoaded = true;
 		}
 		public function save(){
 			if(count(array_keys($this->cache))==0)
 				return;
-			$this->db->query('UPDATE '.static::$tableName.' SET '.join(',', array_map(function($o){
-				return $o.'="'.$this->db->real_escape_string($this->cache[$o]).'"';
+			static::$db->query('UPDATE '.static::$tableName.' SET '.join(',', array_map(function($o){
+				return $o.'="'.static::$db->real_escape_string($this->cache[$o]).'"';
 			}, array_keys($this->cache))).' WHERE id='.intval($this->id));
 			$this->resetCache();
 		}
@@ -196,33 +212,54 @@
 		public function getRelationsInCache(){
 			return array_keys($this->relations);
 		}
-		public function getRelation($relationName, $refresh = false){
+
+		private function _storeRelationInCache($relation, $idsLst){
+			if(!array_key_exists($relation['name'], $this->relations))
+				$this->relations[$relation['name']] = array();
+				
+			$this->relations[$relation['name']]['cache'] = null; 
+			$this->relations[$relation['name']]['cacheIds'] = array_map(
+				function($o){
+					return intval($o);
+				},
+				$idsLst
+			);
+		}
+
+		public function getRelation($relationName, $refresh = false, $getIdIfNoBetter = false){
 			if(!$this->doesRelationExists($relationName))
 				throw new Exception("Error Processing Request", 1);
 			
 			$relation = $this->getRelationDescriptor($relationName);
 
 			if(!array_key_exists($relationName, $this->relations) || $refresh){
-				$this->relations[$relationName] = array();
 				$sortPart = '';
 				if(@$relation['sort'])
 					$sortPart = ' ORDER BY '.$relation['sort'];
+
 				$idsLst = LittlePAPI::_makeFreeSQLOneRow(
 						'SELECT `'.$relation['externId'].'` FROM `'.$relation['tableName'].'` WHERE `'.$relation['internId'].'`='.$this->id.$sortPart,
 						$relation['externId'],
 						true
 					);
-				if($relation['classObject']===false)
-					$this->relations[$relationName]['cache'] = $idsLst;
-				else{
-					if(count($idsLst))
+
+				$this->_storeRelationInCache($relation, $idLst);
+			}
+
+			if($relation['classObject']===false || ($getIdIfNoBetter && !$this->pleaseFullLoad && !@$this->relations[$relationName]['cache']))
+				return $this->relations[$relationName]['cacheIds'];
+			else{
+				if(!@$this->relations[$relationName]['cache']){
+					$idsLst = $this->relations[$relationName]['cacheIds'];
+					if(count($idsLst)){
+						$relation['classObject']::$forceLoadFull = false;
 						$this->relations[$relationName]['cache'] = $relation['classObject']::_fetchAll(' WHERE id IN ('.implode(', ', $idsLst).')');
+					}
 					else
 						$this->relations[$relationName]['cache'] = [];
 				}
+				return $this->relations[$relationName]['cache'];
 			}
-
-			return $this->relations[$relationName]['cache'];
 		}
 		public function addRelation($relationName, $id){
 			if(!$this->doesRelationExists($relationName))
@@ -323,20 +360,20 @@
 
 			$this->callCustomHandler('afterSet', $key, $value);
 		}
-		public function get($key){
+		public function get($key, $getIdIfNoBetter = false){
 			if(!$this->isLoaded)
 				$this->load();
 
 			$this->callCustomHandler('beforeGet', $key, null);
-			if  (
-					!$this->callCustomHandler('constraintGet',	$key, null)['result']  ||
-					 $this->callCustomHandler('getter',			$key, null)['defined']
-				)
-					return false;
+			if  (!$this->callCustomHandler('constraintGet',	$key, null)['result'])
+				return false;
+			$o = $this->callCustomHandler('getter', $key, null);
+			if  ($o['defined'])
+				return $o['result'];
 
 			$value = null;
 			if($this->doesRelationExists($key))
-				$value = $this->getRelation($key);
+				$value = $this->getRelation($key, false, $getIdIfNoBetter);
 			else if(!in_array($key, static::$keys))
 				throw new Exception("Key \"".$key."\" doesn't exists");
 			else if(array_key_exists($key, $this->cache))
@@ -349,7 +386,6 @@
 				return $r['result'];
 			return $value;
 		}
-
 
 
 
@@ -397,7 +433,7 @@
 					return false;
 			}
 
-			$result = static::$db->query('SELECT * FROM '.static::$tableName.' '.$endClause) or die(mysqli_error(static::$db));
+			$result = static::$db->query(static::_constructSQLRequest().' '.$endClause) or die(mysqli_error(static::$db));
 			$tab = array();
 			while($line = $result->fetch_assoc()){
 				$o = new $class($line['id']);
@@ -428,10 +464,18 @@
 					$obj[$key] = $givenValue;
 			};
 
+
 			foreach ($o::$keys as $key)
 				$addSpecKey($key, $o->get($key));
+
 			foreach ($o->getRelationsInCache() as $key)
-				$addSpecKey($key, $o->get($key));
+				$addSpecKey($key, $o->get($key, true));
+			
+			// global $COUNT_DEBUG;
+			// var_dump($COUNT_DEBUG--);
+			// var_dump(get_class($o));
+			// if($COUNT_DEBUG<70)
+			// 	die('stack overflow ');
 			$addSpecKey('id', $o->id);
 
 			return $obj;
@@ -441,7 +485,9 @@
 
 
 		/* ############# API Bindings ############# */ 
-		private static function _followApiVerb($class, $getMethodsFactory, $prefix, $getParams, $data, $acceptNoId = false){
+		private static function _followApiVerb($class, $getMethodsFactory, $prefix, $getParams, $data, $acceptNoId = false, $shouldLoadFull = false){
+			if($shouldLoadFull)
+				$class::$forceLoadFull = true;
 			$getMethodsF = $getMethodsFactory($prefix);
 
 			if(@$getParams[0]=='@userId' && getUserType()>ANONYME)
@@ -467,7 +513,6 @@
 				}
 			}elseif($acceptNoId){
 				$getMethods = $getMethodsF($class.'s');
-
 				$action = @$getParams[0];
 				if(!$action)
 					$action = 'all';
@@ -484,7 +529,7 @@
 				return [false, false];
 			}
 		}
-		public static function _bindApiGet($getParams, $postParams, $verb){
+		public static function _bindApiGet($getParams, $postParams, $verb, $shouldLoadFull){
 			$class = get_called_class();
 			$getMethodsF = function($prefix){
 				return function($className) use ($prefix){
@@ -502,13 +547,13 @@
 				};
 			};
 			if($verb=='GET'){
-				$result = self::_followApiVerb($class, $getMethodsF, 'get', $getParams, $postParams, true);
+				$result = self::_followApiVerb($class, $getMethodsF, 'get', $getParams, $postParams, true, $shouldLoadFull);
 				if($result[0]===true)
 					return $result[1];
 				elseif($result[0]===false && $result[1]!==false){
 					$v = false;
 					try{
-						$v = $result[1]->get($result[2]);
+						$v = $result[1]->get($result[2], $shouldLoadFull);
 					}catch(Exception $e){}
 					return $v;
 				}else
@@ -575,11 +620,18 @@
 			$POST = json_decode(file_get_contents('php://input'), true);
 			$d = null;
 
+
+			$shouldLoadFull = false;
+			if($urlParams[0]=='full'){
+				$shouldLoadFull = true;
+				array_shift($urlParams);
+			}
+
 			if($urlParams==0 || !isset($route[$urlParams[0]]))
 				$d = 'error';
 			else{
 				$class = $route[array_shift($urlParams)];
-				$d = $class::_bindApiGet($urlParams, $POST, $_SERVER['REQUEST_METHOD']);
+				$d = $class::_bindApiGet($urlParams, $POST, $_SERVER['REQUEST_METHOD'], $shouldLoadFull);
 			}
 			
 			echo json_encode($d);
